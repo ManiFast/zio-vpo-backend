@@ -1,0 +1,30 @@
+# .githubworkflowsbuild.yml
+name Build tray app
+
+on
+  push
+    branches
+      - feattask-1-tray-app
+  pull_request
+    branches
+      - main
+
+jobs
+  build
+    runs-on windows-latest
+
+    steps
+      - name Checkout repository
+        uses actionscheckout@v4
+
+      - name Setup MSBuild
+        uses microsoftsetup-msbuild@v2
+
+      - name Build solution
+        run msbuild SAV-Antivirus.sln pConfiguration=Release pPlatform=x64
+
+      - name Upload build artifact
+        uses actionsupload-artifact@v4
+        with
+          name SAV-Antivirus-Release-x64
+          path SAV-Antivirusx64ReleaseSAV-Antivirus.exe
