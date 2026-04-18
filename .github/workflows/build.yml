@@ -1,30 +1,44 @@
-# .githubworkflowsbuild.yml
-name Build tray app
+name: Build tray app
 
-on
-  push
-    branches
-      - feattask-1-tray-app
-  pull_request
-    branches
+on:
+  push:
+    branches:
+      - feat/task-1-tray-app
+      - main
+  pull_request:
+    branches:
       - main
 
-jobs
-  build
-    runs-on windows-latest
+jobs:
+  build:
+    runs-on: windows-latest
 
-    steps
-      - name Checkout repository
-        uses actionscheckout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name Setup MSBuild
-        uses microsoftsetup-msbuild@v2
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
 
-      - name Build solution
-        run msbuild SAV-Antivirus.sln pConfiguration=Release pPlatform=x64
+      - name: Build solution
+        run: msbuild SAV-Antivirus.sln /p:Configuration=Release /p:Platform=x64
 
-      - name Upload build artifact
-        uses actionsupload-artifact@v4
-        with
-          name SAV-Antivirus-Release-x64
-          path SAV-Antivirusx64ReleaseSAV-Antivirus.exe
+      - name: Find built exe
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path . -Recurse -Filter "SAV-Antivirus.exe" |
+            Where-Object { $_.FullName -match 'Release' } |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $exe) {
+            throw "SAV-Antivirus.exe not found after build"
+          }
+
+          "EXE_PATH=$exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Found exe: $exe"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAV-Antivirus-Release-x64
+          path: ${{ env.EXE_PATH }}
