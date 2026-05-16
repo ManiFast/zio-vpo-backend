@@ -1,0 +1,9 @@
+﻿  64 bit Processing C:\Users\karak\source\repos\SAV-Antivirus\SAV-Service\..\SAV-Rpc\SAVRpc.idl
+  SAVRpc.idl
+  SAV-Service.cpp
+  SAVRpcServerStubs.c
+  Generating code
+  Previous IPDB not found, fall back to full compilation.
+  All 278 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  Finished generating code
+  SAV-Service.vcxproj -> C:\Users\karak\source\repos\SAV-Antivirus\x64\Release\SAV-Service.exe
