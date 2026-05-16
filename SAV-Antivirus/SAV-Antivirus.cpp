@@ -1,12 +1,24 @@
-﻿#define NOMINMAX
+#define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
 #include <gdiplus.h>
 #include <string>
 #include <memory>
+#include <tlhelp32.h>
+#include <winsvc.h>
+#include <rpc.h>
+#include <cstdlib>
+
+extern "C"
+{
+//#include "SAVRpc.h"
+#include "Generated/SAVRpc.h"
+}
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "rpcrt4.lib")
 
 using namespace Gdiplus;
 
@@ -14,6 +26,9 @@ using namespace Gdiplus;
 const wchar_t CLASS_NAME[] = L"SAV_Main_Window";
 const wchar_t WINDOW_TITLE[] = L"SAV";
 const wchar_t MUTEX_NAME[] = L"Local\\SAV_Antivirus_SingleInstance";
+const wchar_t SERVICE_NAME[] = L"SAVService";
+const wchar_t SERVICE_PROCESS_NAME[] = L"SAV-Service.exe";
+const wchar_t RPC_ENDPOINT[] = L"SAVServiceRpc";
 
 const int SIDEBAR_WIDTH = 240;
 const UINT WM_TRAYICON = WM_APP + 1;
@@ -22,14 +37,14 @@ const UINT WM_TRAYICON = WM_APP + 1;
 enum
 {
     IDC_BTN_OVERVIEW = 1001,
-    IDC_BTN_SCAN = 1002,
-    IDC_BTN_ABOUT = 1003,
+    IDC_BTN_SCAN     = 1002,
+    IDC_BTN_ABOUT    = 1003,
 
-    ID_TRAY_OPEN = 2001,
-    ID_TRAY_ABOUT = 2002,
-    ID_TRAY_EXIT = 2003,
+    ID_TRAY_OPEN     = 2001,
+    ID_TRAY_ABOUT    = 2002,
+    ID_TRAY_EXIT     = 2003,
 
-    ID_FILE_EXIT = 3001
+    ID_FILE_EXIT     = 3001
 };
 
 enum Page
@@ -60,15 +75,48 @@ Image* g_pLogo = nullptr;
 
 ULONG_PTR g_gdiplusToken = 0;
 UINT g_TaskbarCreatedMsg = 0;
-
 HANDLE g_hMutex = nullptr;
+extern "C" handle_t SAVRpcBinding = nullptr;
 
 int g_currentPage = PAGE_OVERVIEW;
-bool g_realExit = false;
 bool g_startHidden = false;
 
 std::wstring g_mainLogoPath;
 std::wstring g_trayLogoPath;
+
+extern "C" _Ret_maybenull_ void* __RPC_USER midl_user_allocate(_In_ size_t size)
+{
+    return malloc(size);
+}
+
+extern "C" void __RPC_USER midl_user_free(_In_opt_ void* p)
+{
+    free(p);
+}
+
+// strings
+std::wstring ToLower(std::wstring s)
+{
+    for (auto& ch : s)
+        ch = (wchar_t)towlower(ch);
+    return s;
+}
+
+bool HasArg(const wchar_t* cmdLine, const wchar_t* arg)
+{
+    if (!cmdLine)
+        return false;
+
+    return ToLower(cmdLine).find(ToLower(arg)) != std::wstring::npos;
+}
+
+bool HasTrayArg(const wchar_t* cmdLine)
+{
+    return HasArg(cmdLine, L"--tray") ||
+           HasArg(cmdLine, L"/tray") ||
+           HasArg(cmdLine, L"-tray") ||
+           HasArg(cmdLine, L"--hidden");
+}
 
 // file utils
 bool FileExists(const std::wstring& path)
@@ -118,32 +166,226 @@ std::wstring FindAsset(const wchar_t* fileName)
     return tries[0];
 }
 
-// start args
-bool HasTrayArg(const wchar_t* lpCmdLine)
+// service check
+bool QueryServiceState(DWORD& state)
 {
-    if (!lpCmdLine)
+    state = SERVICE_STOPPED;
+
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm)
         return false;
 
-    std::wstring cmd = lpCmdLine;
+    SC_HANDLE svc = OpenServiceW(scm, SERVICE_NAME, SERVICE_QUERY_STATUS);
+    if (!svc)
+    {
+        CloseServiceHandle(scm);
+        return false;
+    }
 
-    return cmd.find(L"--tray") != std::wstring::npos ||
-        cmd.find(L"/tray") != std::wstring::npos ||
-        cmd.find(L"-tray") != std::wstring::npos ||
-        cmd.find(L"--hidden") != std::wstring::npos;
+    SERVICE_STATUS_PROCESS ssp{};
+    DWORD bytes = 0;
+    BOOL ok = QueryServiceStatusEx(
+        svc,
+        SC_STATUS_PROCESS_INFO,
+        reinterpret_cast<LPBYTE>(&ssp),
+        sizeof(ssp),
+        &bytes
+    );
+
+    if (ok)
+        state = ssp.dwCurrentState;
+
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return ok == TRUE;
+}
+
+bool StartServiceAndWait()
+{
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm)
+        return false;
+
+    SC_HANDLE svc = OpenServiceW(scm, SERVICE_NAME, SERVICE_START | SERVICE_QUERY_STATUS);
+    if (!svc)
+    {
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS ssp{};
+    DWORD bytes = 0;
+
+    if (!QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &bytes))
+    {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    if (ssp.dwCurrentState == SERVICE_RUNNING)
+    {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return true;
+    }
+
+    if (ssp.dwCurrentState == SERVICE_STOPPED)
+        StartServiceW(svc, 0, nullptr);
+
+    bool running = false;
+    for (int i = 0; i < 60; ++i)
+    {
+        Sleep(500);
+        if (!QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &bytes))
+            break;
+
+        if (ssp.dwCurrentState == SERVICE_RUNNING)
+        {
+            running = true;
+            break;
+        }
+
+        if (ssp.dwCurrentState == SERVICE_STOPPED)
+            break;
+    }
+
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return running;
+}
+
+bool EnsureServiceRunningOrStart()
+{
+    DWORD state = SERVICE_STOPPED;
+    if (!QueryServiceState(state))
+        return false;
+
+    if (state == SERVICE_RUNNING)
+        return true;
+
+    return StartServiceAndWait();
+}
+
+// parent process
+DWORD GetParentPid(DWORD pid)
+{
+    DWORD parentPid = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return 0;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (pe.th32ProcessID == pid)
+            {
+                parentPid = pe.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return parentPid;
+}
+
+std::wstring GetProcessName(DWORD pid)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return L"";
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    std::wstring name;
+
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (pe.th32ProcessID == pid)
+            {
+                name = pe.szExeFile;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return name;
+}
+
+bool IsStartedByService()
+{
+    DWORD parentPid = GetParentPid(GetCurrentProcessId());
+    if (!parentPid)
+        return false;
+
+    return ToLower(GetProcessName(parentPid)) == ToLower(SERVICE_PROCESS_NAME);
+}
+
+// rpc client
+bool RequestServiceStop()
+{
+    RPC_WSTR strBinding = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        reinterpret_cast<RPC_WSTR>((wchar_t*)L"ncalrpc"),
+        nullptr,
+        reinterpret_cast<RPC_WSTR>((wchar_t*)RPC_ENDPOINT),
+        nullptr,
+        &strBinding
+    );
+
+    if (status != RPC_S_OK)
+        return false;
+
+    status = RpcBindingFromStringBindingW(strBinding, &SAVRpcBinding);
+    RpcStringFreeW(&strBinding);
+
+    if (status != RPC_S_OK)
+        return false;
+
+    bool ok = true;
+
+    RpcTryExcept
+    {
+        SavStopService();
+    }
+    RpcExcept(1)
+    {
+        ok = false;
+    }
+    RpcEndExcept
+
+    RpcBindingFree(&SAVRpcBinding);
+    return ok;
+}
+
+void StopServiceFromUi(HWND hWnd)
+{
+    if (!RequestServiceStop())
+    {
+        MessageBoxW(hWnd, L"Не удалось отправить команду остановки службе SAV.", L"SAV", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    ShowWindow(hWnd, SW_HIDE);
 }
 
 // single instance
 bool CreateSingleInstanceGuard()
 {
     g_hMutex = CreateMutexW(nullptr, TRUE, MUTEX_NAME);
-
     if (!g_hMutex)
         return true;
 
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
-        return false;
-
-    return true;
+    return GetLastError() != ERROR_ALREADY_EXISTS;
 }
 
 void FreeSingleInstanceGuard()
@@ -249,9 +491,6 @@ void UpdateButtonFonts()
 
 void LayoutControls(HWND hWnd)
 {
-    RECT rc{};
-    GetClientRect(hWnd, &rc);
-
     int x = 20;
     int w = SIDEBAR_WIDTH - 40;
     int h = 42;
@@ -279,10 +518,10 @@ void CreateTrayMenu()
         DestroyMenu(g_hTrayMenu);
 
     g_hTrayMenu = CreatePopupMenu();
-    AppendMenuW(g_hTrayMenu, MF_STRING, ID_TRAY_OPEN, L"Открыть");
+    AppendMenuW(g_hTrayMenu, MF_STRING, ID_TRAY_OPEN,  L"Открыть");
     AppendMenuW(g_hTrayMenu, MF_STRING, ID_TRAY_ABOUT, L"О программе");
     AppendMenuW(g_hTrayMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(g_hTrayMenu, MF_STRING, ID_TRAY_EXIT, L"Выход");
+    AppendMenuW(g_hTrayMenu, MF_STRING, ID_TRAY_EXIT,  L"Выход");
 }
 
 bool AddTrayIcon(HWND hWnd)
@@ -333,11 +572,7 @@ void ShowTrayMenu(HWND hWnd)
     GetCursorPos(&pt);
 
     SetForegroundWindow(hWnd);
-    TrackPopupMenu(
-        g_hTrayMenu,
-        TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-        pt.x, pt.y, 0, hWnd, nullptr
-    );
+    TrackPopupMenu(g_hTrayMenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hWnd, nullptr);
     PostMessageW(hWnd, WM_NULL, 0, 0);
 }
 
@@ -349,17 +584,13 @@ void DrawLogo(Graphics& g, const RECT& rc)
 
     REAL imgW = (REAL)g_pLogo->GetWidth();
     REAL imgH = (REAL)g_pLogo->GetHeight();
-
     REAL boxW = (REAL)(rc.right - rc.left);
     REAL boxH = (REAL)(rc.bottom - rc.top);
-
     REAL scaleX = boxW / imgW;
     REAL scaleY = boxH / imgH;
     REAL ratio = (scaleX < scaleY) ? scaleX : scaleY;
-
     REAL drawW = imgW * ratio;
     REAL drawH = imgH * ratio;
-
     REAL x = (REAL)rc.left + (boxW - drawW) / 2.0f;
     REAL y = (REAL)rc.top + (boxH - drawH) / 2.0f;
 
@@ -400,26 +631,26 @@ void DrawContent(HDC hdc, RECT rcClient)
     if (g_currentPage == PAGE_OVERVIEW)
     {
         g.DrawString(L"Обзор", -1, &titleFont, titleRect, nullptr, &titleBrush);
-        g.DrawString(L"Главная страница SAV.", -1, &textFont, textRect, nullptr, &textBrush);
+        g.DrawString(L"Графическое приложение запущено службой SAV.", -1, &textFont, textRect, nullptr, &textBrush);
 
-        RectF okRect((REAL)SIDEBAR_WIDTH + 35, 130.0f, 400.0f, 30.0f);
-        g.DrawString(L"Статус: интерфейс работает.", -1, &textFont, okRect, nullptr, &greenBrush);
+        RectF okRect((REAL)SIDEBAR_WIDTH + 35, 130.0f, 600.0f, 30.0f);
+        g.DrawString(L"Статус: служба управляет приложением.", -1, &textFont, okRect, nullptr, &greenBrush);
     }
     else if (g_currentPage == PAGE_SCAN)
     {
         g.DrawString(L"Сканирование", -1, &titleFont, titleRect, nullptr, &titleBrush);
-        g.DrawString(L"Тут скоро что-то будет.", -1, &textFont, textRect, nullptr, &textBrush);
+        g.DrawString(L"Тут скоро будет модуль проверки файлов.", -1, &textFont, textRect, nullptr, &textBrush);
     }
     else if (g_currentPage == PAGE_ABOUT)
     {
         g.DrawString(L"О программе", -1, &titleFont, titleRect, nullptr, &titleBrush);
-        g.DrawString(L"SAV — минималистичная заготовка антивируса.", -1, &textFont, textRect, nullptr, &textBrush);
+        g.DrawString(L"SAV — графический клиент, запущенный Windows-службой.", -1, &textFont, textRect, nullptr, &textBrush);
 
-        RectF infoRect((REAL)SIDEBAR_WIDTH + 35, 130.0f, 820.0f, 100.0f);
-        g.DrawString(L"Крестик скрывает окно в трей.\nПосле перезапуска explorer.exe иконка в трее возвращается.", -1, &textFont, infoRect, nullptr, &textBrush);
+        RectF infoRect((REAL)SIDEBAR_WIDTH + 35, 130.0f, 820.0f, 120.0f);
+        g.DrawString(L"Выход из меню отправляет RPC-команду службе.\nСлужба после остановки завершает запущенные GUI-процессы.", -1, &textFont, infoRect, nullptr, &textBrush);
     }
 
-    g.DrawString(L"Версия 0.1", -1, &smallFont, versionRect, nullptr, &textBrush);
+    g.DrawString(L"Версия 0.2", -1, &smallFont, versionRect, nullptr, &textBrush);
 }
 
 void DrawMenuButton(LPDRAWITEMSTRUCT dis, const wchar_t* text, bool selected)
@@ -436,9 +667,7 @@ void DrawMenuButton(LPDRAWITEMSTRUCT dis, const wchar_t* text, bool selected)
         HPEN pen = CreatePen(PS_SOLID, 1, RGB(180, 214, 245));
         HGDIOBJ oldPen = SelectObject(hdc, pen);
         HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-
         RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
-
         SelectObject(hdc, oldBrush);
         SelectObject(hdc, oldPen);
         DeleteObject(pen);
@@ -448,11 +677,9 @@ void DrawMenuButton(LPDRAWITEMSTRUCT dis, const wchar_t* text, bool selected)
     SetTextColor(hdc, selected ? RGB(24, 78, 126) : RGB(60, 72, 84));
 
     HFONT oldFont = (HFONT)SelectObject(hdc, g_hFont);
-
     RECT textRc = rc;
     textRc.left += 14;
     DrawTextW(hdc, text, -1, &textRc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-
     SelectObject(hdc, oldFont);
 }
 
@@ -461,7 +688,7 @@ void ShowAbout(HWND hWnd)
 {
     MessageBoxW(
         hWnd,
-        L"SAV\n\nМинималистичная заготовка антивируса.\nКрестик скрывает окно в трей.\nИконка в трее восстанавливается после перезапуска Explorer.",
+        L"SAV\n\nГрафическое приложение запускается Windows-службой.\nВыход отправляет команду остановки службы через Windows RPC ALPC.",
         L"О программе",
         MB_OK | MB_ICONINFORMATION
     );
@@ -480,23 +707,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
     {
-        g_btnOverview = CreateWindowW(L"BUTTON", L"Обзор",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hWnd, (HMENU)IDC_BTN_OVERVIEW, g_hInst, nullptr);
+        g_btnOverview = CreateWindowW(L"BUTTON", L"Обзор", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hWnd, (HMENU)IDC_BTN_OVERVIEW, g_hInst, nullptr);
+        g_btnScan = CreateWindowW(L"BUTTON", L"Сканирование", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hWnd, (HMENU)IDC_BTN_SCAN, g_hInst, nullptr);
+        g_btnAbout = CreateWindowW(L"BUTTON", L"О программе", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 0, 0, hWnd, (HMENU)IDC_BTN_ABOUT, g_hInst, nullptr);
 
-        g_btnScan = CreateWindowW(L"BUTTON", L"Сканирование",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hWnd, (HMENU)IDC_BTN_SCAN, g_hInst, nullptr);
-
-        g_btnAbout = CreateWindowW(L"BUTTON", L"О программе",
-            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-            0, 0, 0, 0, hWnd, (HMENU)IDC_BTN_ABOUT, g_hInst, nullptr);
-
-        g_hFont = CreateFontW(
-            -20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI"
-        );
+        g_hFont = CreateFontW(-20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
         UpdateButtonFonts();
         LayoutControls(hWnd);
@@ -540,8 +755,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case ID_TRAY_EXIT:
         case ID_FILE_EXIT:
-            g_realExit = true;
-            DestroyWindow(hWnd);
+            StopServiceFromUi(hWnd);
             return 0;
         }
         return 0;
@@ -561,12 +775,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_CLOSE:
-        if (!g_realExit)
-        {
-            HideToTray(hWnd);
-            return 0;
-        }
-        break;
+        HideToTray(hWnd);
+        return 0;
 
     case WM_TRAYICON:
     {
@@ -593,11 +803,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         PAINTSTRUCT ps{};
         HDC hdc = BeginPaint(hWnd, &ps);
-
         RECT rcClient{};
         GetClientRect(hWnd, &rcClient);
         DrawContent(hdc, rcClient);
-
         EndPaint(hWnd, &ps);
         return 0;
     }
@@ -613,15 +821,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 // entry
 int WINAPI wWinMain(_In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE,
-    _In_ PWSTR lpCmdLine,
-    _In_ int nCmdShow)
+                    _In_opt_ HINSTANCE,
+                    _In_ PWSTR lpCmdLine,
+                    _In_ int nCmdShow)
 {
-    g_hInst = hInstance;
+    bool fromService = HasArg(lpCmdLine, L"--from-service");
     g_startHidden = HasTrayArg(lpCmdLine);
+
+    if (!fromService)
+    {
+        EnsureServiceRunningOrStart();
+        return 0;
+    }
+
+    if (!IsStartedByService())
+        return 0;
 
     if (!CreateSingleInstanceGuard())
         return 0;
+
+    g_hInst = hInstance;
 
     GdiplusStartupInput gdiplusStartupInput;
     if (GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr) != Ok)
@@ -664,18 +883,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance,
         return 0;
     }
 
-    g_hWnd = CreateWindowExW(
-        0,
-        CLASS_NAME,
-        WINDOW_TITLE,
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        1100, 700,
-        nullptr,
-        g_hMainMenu,
-        hInstance,
-        nullptr
-    );
+    g_hWnd = CreateWindowExW(0, CLASS_NAME, WINDOW_TITLE, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1100, 700, nullptr, g_hMainMenu, hInstance, nullptr);
 
     if (!g_hWnd)
     {
@@ -708,45 +916,3 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance,
 
     return (int)msg.wParam;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/* 
-
-Иконка в трее
-AddTrayIcon(hWnd); WM_CREATE
-
-Иконка в трее - создание при появлении новой панели задач
-
-Иконка в трее - открытие главного окна при клике левой кнопкой мыши
-
-
-Иконка в трее - показ контекстного меню при клике правой кнопкой мыши
-
-Контекстное меню иконки в трее - показ главного окна приложения
-
-Контекстное меню иконки в трее - выход из приложения
-
-Главное окно - закрытие окна не приводит к выгрузке приложения
-
-Главное меню главного окна - пункт Выход приводит к завершению приложения
-
-Графическое приложение - не запускаетcz более одного экземпляра в пользовательской сессии
-
-Графическое приложение - настроен конвейер сборки
-
-
-*/

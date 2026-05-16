@@ -1,0 +1,9 @@
+[
+    uuid(6d0f3e9c-4dd7-4c82-9d4c-9d2fb46a5a11),
+    version(1.0),
+    implicit_handle(handle_t SAVRpcBinding)
+]
+interface SAVRpc
+{
+    void SavStopService(void);
+}

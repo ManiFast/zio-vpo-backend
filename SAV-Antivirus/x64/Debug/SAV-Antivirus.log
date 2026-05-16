@@ -1,2 +1,5 @@
-﻿  SAV-Antivirus.cpp
+﻿  64 bit Processing C:\Users\karak\source\repos\SAV-Antivirus\SAV-Antivirus\..\SAV-Rpc\SAVRpc.idl
+  SAVRpc.idl
+  SAV-Antivirus.cpp
+  SAVRpcClientStubs.c
   SAV-Antivirus.vcxproj -> C:\Users\karak\source\repos\SAV-Antivirus\x64\Debug\SAV-Antivirus.exe
